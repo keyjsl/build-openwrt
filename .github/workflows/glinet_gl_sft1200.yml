@@ -20,20 +20,22 @@ on:
       - 'devices/sft1200/.config'
 
 env:
-  REPO_URL: https://github.com/keyjsl/openwrt-sf1200
-  REPO_BRANCH: patch
+  REPO_URL: https://github.com/gl-inet/gl-infra-builder
+  REPO_BRANCH: main
   FEEDS_CONF: feeds.conf.default
-  CONFIG_FILE: devices/sft1200/.config
-  DIY_P1_SH: devices/sft1200/diy-part.sh
-  UPLOAD_BIN_DIR: false
-  UPLOAD_FIRMWARE: true
-  UPLOAD_RELEASE: false
-  TZ: Asia/Singapore
+  CONFIG_FILE: .config
+  DIY_P1_SH: diy-part1.sh
+  DIY_P2_SH: diy-part2.sh
+  UPLOAD_BIN_DIR: true
+  UPLOAD_FIRMWARE: false
+  UPLOAD_COWTRANSFER: false
+  UPLOAD_WETRANSFER: false
+  UPLOAD_RELEASE: true
+  TZ: Asia/Shanghai
 
 jobs:
   build:
     runs-on: ubuntu-20.04
-    if: github.event.repository.owner.id == github.event.sender.id
 
     steps:
     - name: Checkout
@@ -45,105 +47,108 @@ jobs:
       run: |
         sudo rm -rf /etc/apt/sources.list.d/* /usr/share/dotnet /usr/local/lib/android /opt/ghc
         sudo -E apt-get -qq update
-        sudo -E apt-get -qq full-upgrade
-        sudo -E apt-get -qq install build-essential ccache ecj fastjar file g++ gawk gettext git java-propose-classpath libelf-dev libncurses5-dev libncursesw5-dev libssl-dev python python2.7-dev python3 unzip wget python-distutils-extra python3-setuptools python3-dev rsync subversion swig time xsltproc zlib1g-dev zip 
         sudo -E apt-get -qq install $(curl -fsSL git.io/depends-ubuntu-2004)
         sudo -E apt-get -qq autoremove --purge
         sudo -E apt-get -qq clean
         sudo timedatectl set-timezone "$TZ"
         sudo mkdir -p /workdir
         sudo chown $USER:$GROUPS /workdir
+
     - name: Clone source code
       working-directory: /workdir
       run: |
         df -hT $PWD
         git clone $REPO_URL -b $REPO_BRANCH openwrt
         ln -sf /workdir/openwrt $GITHUB_WORKSPACE/openwrt
-        
+        cd openwrt
+        git config --global user.email "you@example.com"
+        git config --global user.name "Your Name"
+        python3 setup.py -c ./configs/config-siflower-18.x.yml && cd openwrt-18.06/siflower/openwrt-18.06
+        ./scripts/gen_config.py target_siflower_gl-sft1200 luci
+
+    - name: Load custom feeds
+      run: |
+        [ -e $FEEDS_CONF ] && mv $FEEDS_CONF openwrt/openwrt-18.06/siflower/openwrt-18.06/feeds.conf.default
+        chmod +x $DIY_P1_SH
+        cd openwrt/openwrt-18.06/siflower/openwrt-18.06
+        $GITHUB_WORKSPACE/$DIY_P1_SH
+
     - name: Update feeds
-      run: cd openwrt/openwrt-18.06 && ./scripts/feeds update -a
+      run: cd openwrt/openwrt-18.06/siflower/openwrt-18.06 && ./scripts/feeds update -a
 
     - name: Install feeds
-      run: cd openwrt/openwrt-18.06 && ./scripts/feeds install -a
-      
-    - name: Load custom packages
-      run: |
-        chmod +x $DIY_P1_SH
-        cd openwrt
-        cd openwrt-18.06
-        $GITHUB_WORKSPACE/$DIY_P1_SH
-      
+      run: cd openwrt/openwrt-18.06/siflower/openwrt-18.06 && ./scripts/feeds install -a
+
     - name: Load custom configuration
       run: |
-        [ -e files ] && mv files openwrt/openwrt-18.06/files
-        [ -e $CONFIG_FILE ] && mv $CONFIG_FILE openwrt/openwrt-18.06/.config
+        [ -e files ] && mv files openwrt/openwrt-18.06/siflower/openwrt-18.06/files
+        [ -e $CONFIG_FILE ] && mv $CONFIG_FILE openwrt/openwrt-18.06/siflower/openwrt-18.06/.config
+        chmod +x $DIY_P2_SH
+        cd openwrt/openwrt-18.06/siflower/openwrt-18.06
+        $GITHUB_WORKSPACE/$DIY_P2_SH
+
+    - name: SSH connection to Actions
+      uses: P3TERX/ssh2actions@v1.0.0
+      if: (github.event.inputs.ssh == 'true' && github.event.inputs.ssh  != 'false') || contains(github.event.action, 'ssh')
+      env:
+        TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+
     - name: Download package
       id: package
       run: |
-        cd openwrt
-        cd openwrt-18.06
-        make defconfig
+        cd openwrt/openwrt-18.06/siflower/openwrt-18.06
         make download -j8
-        find dl -size -1024c -exec ls -l {} \;
-        find dl -size -1024c -exec rm -f {} \;
+        
     - name: Compile the firmware
       id: compile
-      continue-on-error: true
       run: |
-        cd openwrt
-        cd openwrt-18.06
+        cd openwrt/openwrt-18.06/siflower/openwrt-18.06
         echo -e "$(nproc) thread compile"
-        make -j$(nproc) || make -j1 || make -j1 V=s
-        echo "::set-output name=status::success"
+        make -j$(nproc) V=s
+        # make -j1 V=s
+        echo "status=success" >> $GITHUB_OUTPUT
         grep '^CONFIG_TARGET.*DEVICE.*=y' .config | sed -r 's/.*DEVICE_(.*)=y/\1/' > DEVICE_NAME
-        grep '^CONFIG_TARGET.*DEVICE.*=y' .config | sed -r 's/.*DEVICE_(.*)=y/\1/' > DEVICE_SAVE_NAME
-         [ -s DEVICE_NAME ] && echo "DEVICE_NAME=_$(cat DEVICE_NAME)" >> $GITHUB_ENV
-         [ -s DEVICE_SAVE_NAME ] && echo "DEVICE_SAVE_NAME=$(cat DEVICE_SAVE_NAME)" >> $GITHUB_ENV
-        echo "FILE_DATE=_$(date +"%Y%m%d")" >> $GITHUB_ENV
-    - name: If Error
-      id: rerun
-      if: steps.compile.outcome == 'failure'
-      run: |
-        curl "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" -d "chat_id=${{ secrets.TELEGRAM_CHAT_ID }}&text=Error occured! Firmware build for ${{ env.DEVICE_SAVE_NAME }} was unsucessful. Starting rerun with make -i -j8"
-        cat openwrt/openwrt-18.06/.config
-        echo '================================================================'
-        cd openwrt
-        cd openwrt-18.06 && make -i -j8
+        [ -s DEVICE_NAME ] && echo "DEVICE_NAME=_$(cat DEVICE_NAME)" >> $GITHUB_ENV
+        echo "FILE_DATE=_$(date +"%Y%m%d%H%M")" >> $GITHUB_ENV
+
     - name: Check space usage
       if: (!cancelled())
       run: df -hT
+
     - name: Upload bin directory
       uses: actions/upload-artifact@main
       if: steps.compile.outputs.status == 'success' && env.UPLOAD_BIN_DIR == 'true'
       with:
         name: OpenWrt_bin${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
-        path: openwrt/openwrt-sf1200/openwrt-18.06/bin
+        path: openwrt/openwrt-18.06/siflower/openwrt-18.06/bin
+
     - name: Organize files
       id: organize
       if: env.UPLOAD_FIRMWARE == 'true' && !cancelled()
       run: |
-        cd openwrt/openwrt-18.06/bin/targets/*/*/
+        cd openwrt/openwrt-18.06/siflower/openwrt-18.06/bin/targets/*/*
         rm -rf packages
-        zip -r ${{ env.DEVICE_SAVE_NAME }}.zip ./*
-        ls -Ahl
-        mkdir zip && mv ${{ env.DEVICE_SAVE_NAME }}.zip zip
-        cp -r *squashfs* ./zip/
-        cd zip && ls -Ahl
         echo "FIRMWARE=$PWD" >> $GITHUB_ENV
-        echo "::set-output name=status::success"
+        echo "status=success" >> $GITHUB_OUTPUT
+
     - name: Upload firmware directory
       uses: actions/upload-artifact@main
       if: steps.organize.outputs.status == 'success' && !cancelled()
       with:
         name: OpenWrt_firmware${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
         path: ${{ env.FIRMWARE }}
+        
     - name: Generate release tag
       id: tag
-      if: steps.organize.outputs.status == 'success' && !cancelled()
+      if: env.UPLOAD_RELEASE == 'true' && !cancelled()
       run: |
-        echo "::set-output name=release_tag::$(date +"%Y.%m.%d")"
+        echo "release_tag=$(date +"%Y.%m.%d-%H%M")" >> $GITHUB_OUTPUT
         touch release.txt
-        echo "::set-output name=status::success"
+        [ $UPLOAD_COWTRANSFER = true ] && echo "🔗 [Cowtransfer](${{ steps.cowtransfer.outputs.url }})" >> release.txt
+        [ $UPLOAD_WETRANSFER = true ] && echo "🔗 [WeTransfer](${{ steps.wetransfer.outputs.url }})" >> release.txt
+        echo "status=success" >> $GITHUB_OUTPUT
+
     - name: Upload firmware to release
       uses: softprops/action-gh-release@v1
       if: steps.tag.outputs.status == 'success' && !cancelled()
@@ -152,12 +157,19 @@ jobs:
       with:
         tag_name: ${{ steps.tag.outputs.release_tag }}
         body_path: release.txt
-        files: ${{ env.FIRMWARE }}/*
+        files: /home/runner/work/Actions-SFT1200/Actions-SFT1200/openwrt/openwrt-18.06/siflower/openwrt-18.06/bin/targets/siflower/openwrt-*squashfs*
+
     - name: Delete workflow runs
-      uses: GitRML/delete-workflow-runs@main
+      uses: wekingchen/delete-workflow-runs@main
       with:
         retain_days: 1
         keep_minimum_runs: 3
-    - name: Telegram push notification
-      if: steps.organize.outputs.status == 'success' && !cancelled()
-      run: curl "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" -d "chat_id=${{ secrets.TELEGRAM_CHAT_ID }}&text=Congratulations! Firmware ${{ env.DEVICE_SAVE_NAME }} successfully uploaded."
+
+    - name: Remove old Releases
+      uses: dev-drprasad/delete-older-releases@v0.2.1
+      if: env.UPLOAD_RELEASE == 'true' && !cancelled()
+      with:
+        keep_latest: 3
+        delete_tags: true
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
